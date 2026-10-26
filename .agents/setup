@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+readonly repo_root
+readonly rust_toolchain="1.96.0"
+
+step() {
+    local label=$1
+    shift
+    local started=$SECONDS
+
+    printf '\n==> %s\n' "$label"
+    "$@"
+    printf '    Completed in %ss\n' "$((SECONDS - started))"
+}
+
+require_commands() {
+    local command
+    local -a missing=()
+
+    for command in cc curl git jq make nix perl pkg-config; do
+        if ! command -v "$command" >/dev/null 2>&1; then
+            missing+=("$command")
+        fi
+    done
+
+    if ((${#missing[@]})); then
+        printf 'Missing required orb tools: %s\n' "${missing[*]}" >&2
+        exit 1
+    fi
+}
+
+install_rust() {
+    export PATH="$HOME/.cargo/bin:$PATH"
+
+    if ! command -v rustup >/dev/null 2>&1; then
+        curl --fail --location --silent --show-error https://sh.rustup.rs |
+            sh -s -- -y --profile minimal --default-toolchain "$rust_toolchain" --no-modify-path
+    fi
+
+    if ! rustup run "$rust_toolchain" rustc --version >/dev/null 2>&1; then
+        rustup toolchain install "$rust_toolchain" --profile minimal
+    fi
+
+    rustup default "$rust_toolchain"
+}
+
+configure_login_shell() {
+    local profile="$HOME/.bash_profile"
+    local marker="# logos-zcash-wallet-core-module Rust toolchain"
+
+    touch "$profile"
+    if ! grep -Fqx "$marker" "$profile"; then
+        cat >> "$profile" <<'EOF'
+
+# logos-zcash-wallet-core-module Rust toolchain
+if [[ -d "$HOME/.cargo/bin" ]]; then
+    case ":${PATH}:" in
+        *":$HOME/.cargo/bin:"*) ;;
+        *) export PATH="$HOME/.cargo/bin:$PATH" ;;
+    esac
+fi
+EOF
+    fi
+}
+
+prepare_sdk_source() {
+    local sdk_repo
+    local sdk_revision
+    local sdk_dir="$repo_root/logos-rust-sdk-src"
+
+    sdk_repo="$(jq -er '
+        .nodes as $nodes
+        | ($nodes[.root].inputs["logos-module-builder"]) as $builder
+        | ($nodes[$builder].inputs["logos-rust-sdk"]) as $sdk
+        | "\($nodes[$sdk].locked.owner)/\($nodes[$sdk].locked.repo)"
+    ' "$repo_root/flake.lock")"
+    sdk_revision="$(jq -er '
+        .nodes as $nodes
+        | ($nodes[.root].inputs["logos-module-builder"]) as $builder
+        | ($nodes[$builder].inputs["logos-rust-sdk"]) as $sdk
+        | $nodes[$sdk].locked.rev
+    ' "$repo_root/flake.lock")"
+
+    if [[ -d "$sdk_dir/.git" ]] && [[ "$(git -C "$sdk_dir" rev-parse HEAD)" == "$sdk_revision" ]]; then
+        return
+    fi
+
+    rm -rf -- "$sdk_dir"
+    git init --quiet "$sdk_dir"
+    git -C "$sdk_dir" -c advice.detachedHead=false fetch --depth=1 \
+        "https://github.com/${sdk_repo}.git" "$sdk_revision"
+    git -C "$sdk_dir" checkout --quiet --detach FETCH_HEAD
+}
+
+prefetch_nix_inputs() {
+    nix --extra-experimental-features 'nix-command flakes' \
+        flake archive --no-write-lock-file --json "$repo_root" >/dev/null
+}
+
+prefetch_cargo_dependencies() {
+    export PATH="$HOME/.cargo/bin:$PATH"
+    cargo "+$rust_toolchain" fetch --manifest-path "$repo_root/rust-lib/Cargo.toml" --locked
+}
+
+main() {
+    cd "$repo_root"
+
+    step "Checking base orb tools" require_commands
+    step "Installing Rust $rust_toolchain" install_rust
+    step "Configuring Rust for login shells" configure_login_shell
+    step "Fetching the pinned Logos Rust SDK" prepare_sdk_source
+    step "Fetching locked Nix inputs" prefetch_nix_inputs
+    step "Fetching locked Cargo dependencies" prefetch_cargo_dependencies
+}
+
+main "$@"
