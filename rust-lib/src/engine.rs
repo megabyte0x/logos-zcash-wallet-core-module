@@ -3,7 +3,7 @@
 //! The sync thread owns the writer connection. Reads use a second connection, so a
 //! scan in progress never delays a balance or an address.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -21,10 +21,10 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::jobs::{JobState, Jobs};
 use crate::keys::Phrase;
+use crate::net::client::CallClass;
 use crate::net::ipc::LOCAL_NODE_URL;
 use crate::net::socks::ProxyAddr;
 use crate::network::ZNetwork;
-use crate::sync::cache::grid_floor;
 use crate::sync::driver::{ErrorSource, Progress, Step, SyncConfig, Syncer, HEAD};
 use crate::sync::fetch;
 use crate::wallet::{self, borrow_db, Db, Meta, WalletDir};
@@ -50,6 +50,18 @@ pub struct Routes {
     /// Servers the user chose to reach without Tor. Each must be https.
     #[serde(default)]
     pub direct: Vec<String>,
+    /// Classes reached without Tor, onion services excepted: `sync` and `tip` at most, with Tor
+    /// for what identifies you. Lookups and sends never go direct this way.
+    #[serde(default, rename = "directFor")]
+    pub direct_for: Vec<CallClass>,
+    /// Where transactions are looked up by txid and by transparent address, if not the sync servers.
+    #[serde(default)]
+    pub details: Option<Vec<String>>,
+    #[serde(default)]
+    pub taddr: Option<Vec<String>>,
+    /// Each server's operator, so the lookups can go to another one than the direct sync.
+    #[serde(default)]
+    pub operators: BTreeMap<String, String>,
 }
 
 impl Routes {
@@ -58,8 +70,14 @@ impl Routes {
         if self.servers.is_empty() {
             return Err("no servers".into());
         }
+        if let Some(c) = self.direct_for.iter().find(|c| !matches!(c, CallClass::Sync | CallClass::Tip)) {
+            return Err(format!("{c:?} calls name the wallet and never go direct"));
+        }
         let broadcast = self.broadcast.clone().unwrap_or_else(|| self.servers.clone());
-        let remote: Vec<&String> = self.servers.iter().chain(&broadcast).filter(|s| *s != LOCAL_NODE_URL).collect();
+        let details = self.details.clone().unwrap_or_else(|| self.servers.clone());
+        let taddr = self.taddr.clone().unwrap_or_else(|| self.servers.clone());
+        let remote: Vec<&String> =
+            self.servers.iter().chain(&broadcast).chain(&details).chain(&taddr).filter(|s| *s != LOCAL_NODE_URL).collect();
         if let Some(bad) = remote.iter().find(|s| !(is_lan_url(s) || s.starts_with("https://") || is_onion_url(s))) {
             return Err(format!("{bad}: servers must be https:// URLs, http:// onion services, or on your own network"));
         }
@@ -72,7 +90,9 @@ impl Routes {
             None => ProxyAddr::direct(),
             Some(s) => ProxyAddr::parse(&self.proxy).map_err(|e| format!("{s} goes through Tor: {e}"))?,
         };
-        let mut cfg = SyncConfig::new(proxy.bypassing(self.direct.iter().cloned()), self.servers.clone());
+        let proxy = proxy.bypassing(self.direct.iter().cloned()).direct_for(self.direct_for.iter().copied());
+        let mut cfg = SyncConfig::new(proxy, self.servers.clone());
+        (cfg.details, cfg.taddr) = (details.clone(), taddr.clone());
         // Tips come from the first server. The local node answers in memory and a LAN server is
         // close, so polling them often costs nothing.
         if self.servers[0] == LOCAL_NODE_URL || is_lan_url(&self.servers[0]) {
@@ -82,9 +102,60 @@ impl Routes {
         if !remote.is_empty() && remote.iter().all(|s| s.starts_with("http://127.0.0.1:")) {
             cfg.tip_poll = Duration::from_secs(2);
         }
+        // Reading from the local node, the servers that send transactions check its chain.
+        if self.servers[0] == LOCAL_NODE_URL {
+            cfg.checkers = broadcast.iter().filter(|s| *s != LOCAL_NODE_URL).cloned().collect();
+        }
         cfg.broadcast = broadcast;
+        if cfg.proxy.splits() {
+            self.split_operators(&mut cfg);
+        }
         Ok(cfg)
     }
+
+    /// With sync direct from a third party, one operator could see this IP download a block and
+    /// a Tor user look up a transaction in it. With a second operator, sync stays with the first
+    /// server's, lookups go to the others, sends try the others first, and the others check the
+    /// sync operator's chain. No fallback for sync or tips dials them directly.
+    fn split_operators(&self, cfg: &mut SyncConfig) {
+        use crate::net::client::is_lan_url;
+        let first = &cfg.servers[0];
+        if first == LOCAL_NODE_URL || is_lan_url(first) {
+            return;
+        }
+        let op = |url: &String| self.operators.get(url).unwrap_or(url).to_ascii_lowercase();
+        let syncing = op(first);
+        let elsewhere = |list: &[String]| -> Vec<String> { list.iter().filter(|u| op(u) != syncing).cloned().collect() };
+        let (details, taddr, broadcast) = (elsewhere(&cfg.details), elsewhere(&cfg.taddr), elsewhere(&cfg.broadcast));
+        if details.is_empty() && taddr.is_empty() && broadcast.is_empty() {
+            return;
+        }
+        cfg.servers.retain(|u| op(u) == syncing);
+        let mut checkers: Vec<String> = vec![];
+        for u in broadcast.iter().chain(&details).chain(&taddr) {
+            if !checkers.contains(u) {
+                checkers.push(u.clone());
+            }
+        }
+        cfg.checkers = checkers;
+        if !details.is_empty() {
+            cfg.details = details;
+        }
+        if !taddr.is_empty() {
+            cfg.taddr = taddr;
+        }
+        let rest: Vec<String> = cfg.broadcast.iter().filter(|u| op(u) == syncing).cloned().collect();
+        cfg.broadcast = broadcast.into_iter().chain(rest).collect();
+    }
+}
+
+/// After `accepted` took a transaction: who must know it within two minutes, another broadcast
+/// server or else the local node when it syncs the wallet, and where it goes again if not. Only a
+/// broadcast server sends it, so the local node is asked, never told.
+fn relay_check(cfg: &SyncConfig, accepted: &str) -> Option<(String, String)> {
+    let check = cfg.broadcast.iter().chain(&cfg.servers).find(|s| *s != accepted)?.clone();
+    let resend = if cfg.broadcast.contains(&check) { check.clone() } else { accepted.to_string() };
+    Some((check, resend))
 }
 
 /// A job's parameters, parsed and taken out of the caller's string at once.
@@ -378,16 +449,7 @@ impl Engine {
         // every new wallet of that hour asks for the same tree state.
         let state = match birthday {
             Some(h) => crate::checkpoints::restore_point(network, h)?,
-            None => {
-                let server = cfg.servers[0].clone();
-                let (tip, _) = self
-                    .rt
-                    .block_on(fetch::tip_and_info(&server, &cfg.proxy, crate::net::socks::Isolation::fresh()))
-                    .map_err(|e| e.to_string())?;
-                let start = grid_floor(tip.saturating_sub(HEAD));
-                let below = self.rt.block_on(fetch::tree_state(&server, &cfg.proxy, start - 1)).map_err(|e| e.to_string())?;
-                below.to_chain_state().map_err(|e| e.to_string())?
-            }
+            None => self.rt.block_on(fetch::start_state(&cfg.servers, &cfg.proxy, HEAD)).map_err(|e| e.to_string())?.to_chain_state().map_err(|e| e.to_string())?,
         };
         let phrase = phrase.unwrap_or_else(Phrase::generate);
         let meta = dir.create(network, name, password, &phrase, state, self.work_factor).map_err(|e| e.to_string())?;
@@ -409,7 +471,9 @@ impl Engine {
         let meta = dir.meta().map_err(|e| e.to_string())?;
         let account = dir.account().map_err(|e| e.to_string())?;
         let key = dir.unlock_db_key(password).map_err(|e| e.to_string())?;
-        let writer = dir.open_db(network, &key).map_err(|e| e.to_string())?;
+        let mut writer = dir.open_db(network, &key).map_err(|e| e.to_string())?;
+        // Before anything reads it: a wallet made by an older build may lack migrations.
+        dir.migrate(&mut writer, password).map_err(|e| e.to_string())?;
         let reader = dir.open_conn(&key).map_err(|e| e.to_string())?;
         let cache = Arc::new(dir.open_cache(&key).map_err(|e| e.to_string())?);
         let mig_conn = dir.open_conn(&key).map_err(|e| e.to_string())?;
@@ -528,11 +592,10 @@ impl Engine {
                 match self.rt.block_on(fetch::send_transaction(server, &cfg.proxy, raw.clone())) {
                     Ok((0, _)) => {
                         outcome = json!({"txid": txid, "accepted": true, "server": server});
-                        // Another operator checks, or the local node when it syncs the wallet.
-                        if let Some(other) = cfg.broadcast.iter().chain(&cfg.servers).find(|s| *s != server).cloned() {
+                        if let Some((check, resend)) = relay_check(&cfg, server) {
                             let (proxy, raw, id) = (cfg.proxy.clone(), raw.clone(), txid_bytes(&txid));
                             self.rt.spawn(async move {
-                                let note = fetch::confirm_elsewhere(&other, &proxy, id, raw).await;
+                                let note = fetch::confirm_elsewhere(&check, &resend, &proxy, id, raw).await;
                                 tracing::info!(target: "zcash", "{note}");
                             });
                         }
@@ -1016,7 +1079,77 @@ mod tests {
             servers: servers.iter().map(|s| s.to_string()).collect(),
             broadcast: (!broadcast.is_empty()).then(|| broadcast.iter().map(|s| s.to_string()).collect()),
             direct: vec![],
+            direct_for: vec![],
+            details: None,
+            taddr: None,
+            operators: BTreeMap::new(),
         }
+    }
+
+    /// The node module's identifying routes for two operators, as the backend passes them.
+    fn identifying(proxy: &str) -> Routes {
+        serde_json::from_value(json!({
+            "proxy": proxy,
+            "servers": ["https://zec.rocks:443", "https://us.zec.stardust.rest:443"],
+            "broadcast": ["https://zec.rocks:443", "https://us.zec.stardust.rest:443"],
+            "details": ["https://zec.rocks:443", "https://na.zec.rocks:443", "https://us.zec.stardust.rest:443"],
+            "taddr": ["https://zec.rocks:443", "https://us.zec.stardust.rest:443"],
+            "directFor": ["sync", "tip"],
+            "operators": {"https://zec.rocks:443": "zec.rocks", "https://na.zec.rocks:443": "zec.rocks",
+                          "https://us.zec.stardust.rest:443": "Stardust"},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn identifying_syncs_from_one_operator_and_looks_up_at_the_other() {
+        use crate::net::client::{path, Path};
+        let cfg = identifying("tor").config().unwrap();
+        let (rocks, stardust) = ("https://zec.rocks:443", "https://us.zec.stardust.rest:443");
+        assert_eq!((cfg.servers.clone(), cfg.details.clone(), cfg.taddr.clone()), (vec![rocks.to_string()], vec![stardust.to_string()], vec![stardust.to_string()]));
+        assert_eq!(cfg.broadcast, [stardust, rocks]);
+        assert_eq!((path(rocks, &cfg.proxy, CallClass::Sync), path(rocks, &cfg.proxy, CallClass::Tip)), (Path::Direct, Path::Direct));
+        for class in [CallClass::Details, CallClass::Taddr, CallClass::Broadcast] {
+            assert_eq!(path(stardust, &cfg.proxy, class), Path::Tor, "{class:?}");
+            assert_eq!(path(rocks, &cfg.proxy, class), Path::Tor, "{class:?}");
+        }
+        // The other operator checks the sync operator's chain through Tor. Tips and subtree roots
+        // fail over only within `servers`, so no fallback dials it directly.
+        assert_eq!(cfg.checkers, [stardust]);
+        assert_eq!(path(stardust, &cfg.proxy, CallClass::Check), Path::Tor);
+        assert!(!cfg.servers.contains(&stardust.to_string()));
+        // One operator: nothing to split, and the copy says that server sees both sides.
+        let mut one = identifying("tor");
+        one.servers.truncate(1);
+        one.operators.insert("https://us.zec.stardust.rest:443".into(), "zec.rocks".into());
+        let cfg = one.config().unwrap();
+        assert_eq!((cfg.servers.len(), cfg.details.len(), cfg.broadcast.len()), (1, 3, 2));
+        assert!(cfg.checkers.is_empty(), "no other operator to check it");
+        // Without operators each url is its own, so lookups still avoid the sync server.
+        let mut bare = identifying("tor");
+        bare.operators.clear();
+        assert!(!bare.config().unwrap().details.contains(&rocks.to_string()));
+        // A sync from the user's own server, or the local node, keeps every lookup there.
+        let mut own = identifying("tor");
+        own.servers.insert(0, "http://192.168.1.20:9067".into());
+        own.details.as_mut().unwrap().insert(0, "http://192.168.1.20:9067".into());
+        assert_eq!(own.config().unwrap().details.len(), 4);
+        let mut local = identifying("tor");
+        (local.servers, local.details, local.taddr) = (vec![LOCAL_NODE_URL.into()], Some(vec![LOCAL_NODE_URL.into()]), Some(vec![LOCAL_NODE_URL.into()]));
+        let cfg = local.config().unwrap();
+        assert_eq!((cfg.servers[0].as_str(), cfg.details[0].as_str(), cfg.taddr[0].as_str()), (LOCAL_NODE_URL, LOCAL_NODE_URL, LOCAL_NODE_URL));
+        assert_eq!(cfg.checkers, [rocks, stardust], "the servers that send check the node");
+        assert_eq!(path(rocks, &cfg.proxy, CallClass::Check), Path::Tor, "the cross-check");
+        // Identifying calls still need a Tor, and never go direct by directFor.
+        assert!(identifying("direct").config().is_err());
+        let mut wrong = identifying("tor");
+        wrong.direct_for.push(CallClass::Broadcast);
+        assert!(wrong.config().unwrap_err().contains("never go direct"));
+        // The old shape still means everything through Tor.
+        let cfg = routes("tor", &[rocks, stardust], &[]).config().unwrap();
+        assert!(!cfg.proxy.splits() && cfg.servers.len() == 2 && cfg.details == cfg.servers);
+        assert!(cfg.checkers.is_empty(), "chunks from each operator in turn must fit together instead");
+        assert_eq!(path(rocks, &cfg.proxy, CallClass::Sync), Path::Tor);
     }
 
     #[test]
@@ -1026,9 +1159,11 @@ mod tests {
         let cfg = routes(tor, &[LOCAL_NODE_URL], &["https://zec.rocks:443"]).config().unwrap();
         assert_eq!((cfg.servers[0].as_str(), cfg.broadcast[0].as_str()), (LOCAL_NODE_URL, "https://zec.rocks:443"));
         assert!(cfg.tip_poll <= Duration::from_secs(5));
+        assert_eq!(cfg.checkers, ["https://zec.rocks:443"]);
         // Only the local node: no proxy needed, and broadcasts go to it too.
         let cfg = routes("", &[LOCAL_NODE_URL], &[]).config().unwrap();
         assert!(cfg.proxy.is_direct() && cfg.broadcast == vec![LOCAL_NODE_URL.to_string()]);
+        assert!(cfg.checkers.is_empty());
         // Anything remote still needs Tor; plain http and other modules are refused.
         assert!(routes("", &[LOCAL_NODE_URL], &["https://zec.rocks:443"]).config().is_err());
         assert!(routes(tor, &[LOCAL_NODE_URL], &["http://zec.rocks:80"]).config().is_err());
@@ -1057,6 +1192,11 @@ mod tests {
         r.direct = vec![onion.clone()];
         assert!(r.config().is_err());
         assert!(routes("direct", &[rocks], &[]).config().is_err());
+        // The built-in Tor, which the node module names `tor`, is reached over IPC.
+        let mut r = routes("tor", &[rocks, onion.as_str()], &[]);
+        r.direct = vec![rocks.into()];
+        let cfg = r.config().unwrap();
+        assert!(cfg.proxy.is_tor() && cfg.proxy.bypasses(rocks));
         // An empty broadcast list syncs but leaves nothing to send through.
         let mut r = routes(tor, &[LOCAL_NODE_URL], &[]);
         r.broadcast = Some(vec![]);
@@ -1064,21 +1204,83 @@ mod tests {
     }
 
     #[test]
+    fn the_relay_check_asks_the_local_node_and_never_sends_through_it() {
+        let (tor, rocks, stardust) = ("socks5h://127.0.0.1:9050", "https://zec.rocks:443", "https://us.zec.stardust.rest:443");
+        // One broadcast server: the node is asked, and a re-send goes back to that server.
+        let cfg = routes(tor, &[LOCAL_NODE_URL], &[rocks]).config().unwrap();
+        assert_eq!(relay_check(&cfg, rocks), Some((LOCAL_NODE_URL.to_string(), rocks.to_string())));
+        // Two: the other is asked, and sent to.
+        let cfg = routes(tor, &[LOCAL_NODE_URL], &[rocks, stardust]).config().unwrap();
+        assert_eq!(relay_check(&cfg, rocks), Some((stardust.to_string(), stardust.to_string())));
+        // Sends through the node itself: it has no one else to ask.
+        let cfg = routes("", &[LOCAL_NODE_URL], &[]).config().unwrap();
+        assert_eq!(relay_check(&cfg, LOCAL_NODE_URL), None);
+        // Identifying: the sync operator is asked over Tor after the other accepted it.
+        let cfg = identifying("tor").config().unwrap();
+        assert_eq!(relay_check(&cfg, stardust), Some((rocks.to_string(), rocks.to_string())));
+    }
+
+    /// Runs a job to its end and panics unless it succeeded.
+    fn run(engine: &Engine, kind: &str, params: &Value) {
+        let job = engine.start_job(kind, params.to_string());
+        let (id, receipt) = (job["jobId"].as_str().unwrap(), job["receipt"].as_str().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let st = engine.jobs().status(id, receipt);
+            match st["state"].as_str() {
+                Some("done") => return,
+                Some("queued" | "running") if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+                _ => panic!("{kind}: {st}"),
+            }
+        }
+    }
+
+    /// A restore starts from a bundled checkpoint, so nothing is fetched; sync only tries.
+    fn restore_params() -> Value {
+        json!({"network": "mainnet", "name": "r", "password": "pw", "phrase": Phrase::generate().as_str(),
+               "birthdayHeight": 3_000_000, "routes": {"proxy": "socks5h://127.0.0.1:9", "servers": ["https://zec.rocks:443"]}})
+    }
+
+    #[test]
     fn a_restored_wallet_is_open() {
         let root = tempfile::tempdir().unwrap();
         let engine = Engine::new(root.path().to_path_buf(), Arc::new(|_| {}), Some(10), None);
-        // A restore starts from a bundled checkpoint, so nothing is fetched; sync only tries.
-        let params = json!({"network": "mainnet", "name": "r", "password": "pw", "phrase": Phrase::generate().as_str(),
-                            "birthdayHeight": 3_000_000, "routes": {"proxy": "socks5h://127.0.0.1:9", "servers": ["https://zec.rocks:443"]}});
-        let job = engine.start_job("restore_wallet", params.to_string());
-        let (id, receipt) = (job["jobId"].as_str().unwrap(), job["receipt"].as_str().unwrap());
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        while engine.jobs().status(id, receipt)["state"] != "done" {
-            assert!(std::time::Instant::now() < deadline, "{}", engine.jobs().status(id, receipt));
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        run(&engine, "restore_wallet", &restore_params());
         let st = engine.wallet_status();
         assert_eq!((&st["open"], &st["name"]), (&json!(true), &json!("r")), "{st}");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn open_applies_missing_migrations() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::new(root.path().to_path_buf(), Arc::new(|_| {}), Some(10), None);
+        let params = restore_params();
+        run(&engine, "restore_wallet", &params);
+        engine.close();
+        // A wallet made under 0.23.0-pre.1 lacks 0.23.0's data-only restore_ua_transparent_receivers.
+        let dir = WalletDir::new(root.path(), ZNetwork::Main, "r");
+        let conn = dir.open_conn(&dir.unlock_db_key("pw").unwrap()).unwrap();
+        let id = uuid::Uuid::parse_str("3eb2409c-6b54-476e-aebc-8f769aa8950f").unwrap();
+        let id = &id.as_bytes()[..];
+        let applied = || conn.query_row("SELECT count(*) FROM schemer_migrations WHERE id = ?1", [id], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(conn.execute("DELETE FROM schemer_migrations WHERE id = ?1", [id]).unwrap(), 1);
+        assert_eq!(applied(), 0);
+
+        // data_version moves when another connection commits.
+        let data_version = || conn.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0)).unwrap();
+        let open = json!({"network": "mainnet", "name": "r", "password": "pw", "routes": params["routes"]});
+        let before = data_version();
+        run(&engine, "open_wallet", &open);
+        engine.close();
+        assert_eq!(applied(), 1);
+        assert_ne!(data_version(), before);
+
+        // A second open has nothing to apply, and commits nothing.
+        let before = data_version();
+        run(&engine, "open_wallet", &open);
+        engine.close();
+        assert_eq!(data_version(), before);
         engine.shutdown();
     }
 

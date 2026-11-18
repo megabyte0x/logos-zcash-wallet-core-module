@@ -6,7 +6,6 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use futures_util::TryStreamExt;
 use serde::Serialize;
 use zcash_client_backend::data_api::chain::{error::Error as ChainError, scan_cached_blocks, ChainState, CommitmentTreeRoot};
 use zcash_client_backend::data_api::scanning::ScanPriority;
@@ -16,7 +15,7 @@ use zcash_client_backend::data_api::{
     SAPLING_SHARD_HEIGHT,
 };
 use zcash_client_backend::proto::compact_formats::CompactBlock;
-use zcash_client_backend::proto::service::{GetSubtreeRootsArg, LightdInfo, ShieldedProtocol};
+use zcash_client_backend::proto::service::{LightdInfo, ShieldedProtocol};
 use zcash_keys::encoding::AddressCodec;
 use zcash_primitives::merkle_tree::HashSer;
 use zcash_primitives::transaction::Transaction;
@@ -28,7 +27,7 @@ use super::crosscheck::{self, CrossCheck, Verdict};
 use super::enhance::{self, Fetched};
 use super::fetch::{self, Chunk};
 use super::frontier::{self, FrontierError};
-use crate::net::client::{connect, NetError};
+use crate::net::client::{CallClass, NetError};
 use crate::net::ipc::LOCAL_NODE_URL;
 use crate::net::socks::{Isolation, ProxyAddr};
 use crate::network::ZNetwork;
@@ -41,13 +40,31 @@ pub const HEAD: u32 = 100;
 const CROSS_CHECK_EVERY: Duration = Duration::from_secs(120);
 const RECHECK_AFTER: Duration = Duration::from_secs(20);
 
+/// A new tip at most HOLD_GAP blocks past the synced one waits for its blocks, HOLD_FOR at
+/// most (see `take_tip`).
+const HOLD_GAP: u32 = 10;
+const HOLD_FOR: Duration = Duration::from_secs(45);
+
+/// Whether a new tip waits for its blocks: it extends, by a few blocks within one chunk, the
+/// tip the wallet is fully scanned to.
+fn holds(old: u32, new: u32, scanned: Option<u32>) -> bool {
+    new > old && new - old <= HOLD_GAP && grid_floor(new) == grid_floor(old) && scanned.is_some_and(|s| s >= old)
+}
+
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
     pub proxy: ProxyAddr,
-    /// Chunks go to these servers in turn; the first also answers tip queries.
+    /// Chunks go to these servers in turn. Tips and subtree roots come from one of them, the next
+    /// after a failure.
     pub servers: Vec<String>,
     /// Where transactions go out; the sync servers unless the routes say otherwise.
     pub broadcast: Vec<String>,
+    /// Where transactions are looked up by txid, and by transparent address.
+    pub details: Vec<String>,
+    pub taddr: Vec<String>,
+    /// Other operators' servers that take turns checking the chain read: the local node's, or with
+    /// sync split from lookups, the sync operator's.
+    pub checkers: Vec<String>,
     pub parallel: usize,
     /// Cached chunks not yet scanned, plus downloads in flight, stay under this.
     pub ahead: usize,
@@ -58,8 +75,8 @@ pub struct SyncConfig {
 
 impl SyncConfig {
     pub fn new(proxy: ProxyAddr, servers: Vec<String>) -> Self {
-        let broadcast = servers.clone();
-        Self { proxy, servers, broadcast, parallel: 2, ahead: 24, work_cap: 2_000, tip_poll: Duration::from_secs(30) }
+        let (broadcast, details, taddr) = (servers.clone(), servers.clone(), servers.clone());
+        Self { proxy, servers, broadcast, details, taddr, checkers: vec![], parallel: 2, ahead: 24, work_cap: 2_000, tip_poll: Duration::from_secs(30) }
     }
 }
 
@@ -96,7 +113,8 @@ pub struct Progress {
     pub blocks_left: Option<u64>,
     pub chunks_cached: usize,
     pub last_error: Option<String>,
-    /// Reading from the local node: how it compared with a server last time.
+    /// How the chain read (the local node's, or the sync server's) compared with another
+    /// operator's server last time.
     pub cross_check: Option<CrossCheck>,
 }
 
@@ -114,7 +132,8 @@ enum Msg {
     Chunk(u32, Result<Chunk, NetError>),
     /// A cached chunk's missing blocks: chunk start, first height, result.
     Tail(u32, u32, Result<Vec<CompactBlock>, NetError>),
-    Tip(Result<(u32, LightdInfo), NetError>),
+    /// The server asked, and its answer.
+    Tip(String, Result<(u32, LightdInfo), NetError>),
     Enhanced(TransactionDataRequest, Result<Fetched, NetError>),
     /// Local node only: an address's transactions up to a height.
     Received(TransparentAddress, u32, Result<Vec<(Transaction, Option<BlockHeight>)>, NetError>),
@@ -136,6 +155,39 @@ pub enum ErrorSource {
     Migration,
     /// The local node against a server.
     CrossCheck,
+}
+
+type Roots<H> = Vec<CommitmentTreeRoot<H>>;
+type OrchardHash = orchard::tree::MerkleHashOrchard;
+
+/// Which server tips and subtree roots come from: the same one while it answers, the next after a
+/// failure, at once until each has had its turn since the last answer.
+#[derive(Debug, Default)]
+struct TipSource {
+    at: usize,
+    failed: usize,
+}
+
+impl TipSource {
+    fn server<'a>(&self, servers: &'a [String]) -> &'a str {
+        &servers[self.at % servers.len()]
+    }
+
+    /// The servers from this one on, each once.
+    fn in_turn<'a>(&self, servers: &'a [String]) -> impl Iterator<Item = &'a String> {
+        servers.iter().cycle().skip(self.at % servers.len()).take(servers.len())
+    }
+
+    /// Moves on after a failure; whether to ask the next one now.
+    fn failed(&mut self, servers: usize) -> bool {
+        self.at += 1;
+        self.failed += 1;
+        self.failed < servers
+    }
+
+    fn answered(&mut self) {
+        self.failed = 0;
+    }
 }
 
 /// Errors by source, so the one shown is the newest that still stands.
@@ -182,7 +234,10 @@ pub struct Syncer {
     tails_in_flight: BTreeSet<u32>,
     tip_in_flight: bool,
     last_tip_poll: Option<Instant>,
+    tip_source: TipSource,
     tip: Option<u32>,
+    /// A newer tip held back while its blocks download, and since when.
+    held: Option<(u32, Instant)>,
     /// Subtree roots stored this session per pool (Sapling, Orchard, Ironwood), and the shards
     /// a window last needed when they were fetched.
     roots: Option<[u64; 3]>,
@@ -200,7 +255,7 @@ pub struct Syncer {
     t_pause: Option<Instant>,
     /// When scanning began this session, and how many blocks since, for the ETA.
     pace: Option<(Instant, u64)>,
-    /// Local node only: the next cross-check, the server it goes to, and a first mismatch.
+    /// The next cross-check, the server it goes to, and a first mismatch.
     check_due: Option<Instant>,
     check_in_flight: bool,
     next_checker: usize,
@@ -235,7 +290,9 @@ impl Syncer {
             tails_in_flight: BTreeSet::new(),
             tip_in_flight: false,
             last_tip_poll: None,
+            tip_source: TipSource::default(),
             tip: None,
+            held: None,
             roots: None,
             roots_asked: [0; 3],
             next_server: 0,
@@ -291,6 +348,7 @@ impl Syncer {
             self.handle(db, msg)?;
         }
         self.poll_tip_if_due();
+        self.advance_held(db)?;
         let Some(tip) = self.tip else {
             self.progress.state = "connecting".into();
             return Ok(Step::Waiting);
@@ -325,49 +383,98 @@ impl Syncer {
         }
         self.tip_in_flight = true;
         self.last_tip_poll = Some(Instant::now());
-        let (server, proxy, tx) = (self.cfg.servers[0].clone(), self.cfg.proxy.clone(), self.tx.clone());
+        let (server, proxy, tx) = (self.tip_source.server(&self.cfg.servers).to_string(), self.cfg.proxy.clone(), self.tx.clone());
         self.rt.spawn(async move {
-            let _ = tx.send(Msg::Tip(fetch::tip_and_info(&server, &proxy, Isolation::fresh()).await));
+            let r = fetch::tip_and_info(&server, &proxy, Isolation::fresh()).await;
+            let _ = tx.send(Msg::Tip(server, r));
         });
     }
 
-    /// Reading from the local node, the servers that send transactions take turns checking it.
+    /// A tip that `holds` waits until its blocks are cached, and is written right before they
+    /// are scanned: written first, the wallet would count its newest notes as pending for the
+    /// whole download, seconds over Tor. Any other tip is written at once.
+    fn take_tip(&mut self, db: &mut Db, tip: u32) -> Result<(), SyncError> {
+        if let Some(old) = self.tip {
+            let scanned = db.block_fully_scanned().map_err(db_err)?.map(|m| u32::from(m.block_height()));
+            if holds(old, tip, scanned) && self.cache.chunk_end(grid_floor(old))?.is_some() {
+                let since = self.held.map_or_else(Instant::now, |(_, since)| since);
+                self.held = Some((tip, since));
+                return Ok(());
+            }
+        }
+        self.held = None;
+        if self.tip != Some(tip) {
+            db.update_chain_tip(BlockHeight::from(tip)).map_err(db_err)?;
+            self.tip = Some(tip);
+        }
+        self.progress.tip = Some(tip);
+        Ok(())
+    }
+
+    /// Writes a held tip once its blocks are cached, or once it has waited HOLD_FOR; until
+    /// then fetches them.
+    fn advance_held(&mut self, db: &mut Db) -> Result<(), SyncError> {
+        let (Some((tip, since)), Some(old)) = (self.held, self.tip) else {
+            return Ok(());
+        };
+        let have = self.cache.contiguous_end(old + 1)?;
+        if have > tip || since.elapsed() >= HOLD_FOR {
+            self.held = None;
+            db.update_chain_tip(BlockHeight::from(tip)).map_err(db_err)?;
+            self.tip = Some(tip);
+            self.progress.tip = Some(tip);
+            return Ok(());
+        }
+        let start = grid_floor(tip);
+        if self.tails_in_flight.contains(&start) || self.retry.get(&start).is_some_and(|r| Instant::now() < r.1) {
+            return Ok(());
+        }
+        self.tails_in_flight.insert(start);
+        let (server, proxy, tx) = (self.server_for(), self.cfg.proxy.clone(), self.tx.clone());
+        self.rt.spawn(async move {
+            let _ = tx.send(Msg::Tail(start, have, fetch::fetch_blocks(&server, &proxy, have, tip).await));
+        });
+        Ok(())
+    }
+
+    /// Other operators' servers take turns checking the chain read: the local node's, or the one
+    /// tips come from.
     fn cross_check_if_due(&mut self) {
-        let checkers: Vec<String> = self.cfg.broadcast.iter().filter(|s| *s != LOCAL_NODE_URL).cloned().collect();
-        if !self.local() || checkers.is_empty() || self.check_in_flight || self.check_due.is_some_and(|t| Instant::now() < t) {
+        let checkers = &self.cfg.checkers;
+        if checkers.is_empty() || self.check_in_flight || self.check_due.is_some_and(|t| Instant::now() < t) {
             return;
         }
         let server = checkers[self.next_checker % checkers.len()].clone();
+        let reference = self.tip_source.server(&self.cfg.servers).to_string();
         self.next_checker += 1;
         self.check_in_flight = true;
         self.check_due = Some(Instant::now() + CROSS_CHECK_EVERY);
         let (proxy, tx, net) = (self.cfg.proxy.clone(), self.tx.clone(), self.params);
         self.rt.spawn(async move {
-            let _ = tx.send(Msg::CrossCheck(crosscheck::check(net, &server, &proxy).await));
+            let _ = tx.send(Msg::CrossCheck(crosscheck::check(net, &reference, &server, &proxy).await));
         });
     }
 
     fn handle(&mut self, db: &mut Db, msg: Msg) -> Result<(), SyncError> {
         match msg {
-            Msg::Tip(r) => {
+            Msg::Tip(server, r) => {
                 self.tip_in_flight = false;
                 match r {
                     Ok((tip, info)) => {
                         // Under the tip's source too, so it stays shown while every poll gives it.
-                        if let Err(e) = self.check_server(&self.cfg.servers[0].clone(), &info, tip) {
+                        if let Err(e) = self.check_server(&server, &info, tip) {
                             self.fail(ErrorSource::Tip, &e);
+                            self.tip_failed();
                             return Err(e);
                         }
-                        if self.tip.is_none_or(|t| t != tip) {
-                            db.update_chain_tip(BlockHeight::from(tip)).map_err(db_err)?;
-                            self.tip = Some(tip);
-                        }
-                        self.progress.tip = Some(tip);
+                        self.tip_source.answered();
+                        self.take_tip(db, tip)?;
                         self.succeed(ErrorSource::Tip);
                     }
                     Err(e) => {
                         tracing::warn!(target: "zcash", "tip poll: {e}");
                         self.fail(ErrorSource::Tip, e);
+                        self.tip_failed();
                     }
                 }
             }
@@ -429,7 +536,8 @@ impl Syncer {
                         self.differed = c.verdict == Verdict::Differs;
                         if self.differed {
                             let at = c.node_tip.min(c.server_tip);
-                            self.fail(ErrorSource::CrossCheck, format!("your node and {} have different blocks at {at}: one of them is on a false chain", c.server));
+                            let read = if c.reference == LOCAL_NODE_URL { "your node".to_string() } else { c.reference.clone() };
+                            self.fail(ErrorSource::CrossCheck, format!("{read} and {} have different blocks at {at}: one of them is on a false chain", c.server));
                         } else {
                             self.succeed(ErrorSource::CrossCheck);
                         }
@@ -457,6 +565,13 @@ impl Syncer {
             }
         }
         Ok(())
+    }
+
+    /// The next server answers tips, at once while one has yet to fail since the last answer.
+    fn tip_failed(&mut self) {
+        if self.tip_source.failed(self.cfg.servers.len()) {
+            self.last_tip_poll = None;
+        }
     }
 
     fn check_server(&self, server: &str, info: &LightdInfo, tip: u32) -> Result<(), SyncError> {
@@ -498,24 +613,33 @@ impl Syncer {
         Ok(())
     }
 
-    /// Loads the subtree roots completed since `from`, per pool, and returns how many each now has.
+    /// Loads the subtree roots completed since `from`, per pool, and returns how many each now has:
+    /// from the server tips come from, else the next that answers.
     fn load_subtree_roots(&mut self, db: &mut Db, from: [u64; 3]) -> Result<[u64; 3], SyncError> {
-        let (server, proxy) = (self.cfg.servers[0].clone(), self.cfg.proxy.clone());
+        let mut last = None;
+        for server in self.tip_source.in_turn(&self.cfg.servers).cloned().collect::<Vec<_>>() {
+            match self.subtree_roots_from(&server, from) {
+                Ok((sapling, orchard, ironwood)) => {
+                    let [s, o, i] = from;
+                    db.put_sapling_subtree_roots(s, &sapling).map_err(db_err)?;
+                    db.put_orchard_subtree_roots(o, &orchard).map_err(db_err)?;
+                    db.put_ironwood_subtree_roots(i, &ironwood).map_err(db_err)?;
+                    return Ok([s + sapling.len() as u64, o + orchard.len() as u64, i + ironwood.len() as u64]);
+                }
+                Err(e) => {
+                    tracing::warn!(target: "zcash", "subtree roots: {e}");
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.expect("at least one server"))
+    }
+
+    fn subtree_roots_from(&self, server: &str, from: [u64; 3]) -> Result<(Roots<sapling::Node>, Roots<OrchardHash>, Roots<OrchardHash>), SyncError> {
+        let (server, proxy) = (server.to_string(), self.cfg.proxy.clone());
         let fetch = |p: ShieldedProtocol, start: u64| {
             let (server, proxy) = (server.clone(), proxy.clone());
-            async move {
-                let mut c = connect(&server, &proxy, Isolation::fresh()).await?;
-                let arg = GetSubtreeRootsArg { start_index: start as u32, shielded_protocol: p as i32, max_entries: 0 };
-                let roots: Vec<_> = c
-                    .get_subtree_roots(arg)
-                    .await
-                    .map_err(|status| NetError::Status { server: server.clone(), status })?
-                    .into_inner()
-                    .try_collect()
-                    .await
-                    .map_err(|status| NetError::Status { server: server.clone(), status })?;
-                Ok::<_, NetError>(roots)
-            }
+            async move { fetch::subtree_roots(&server, &proxy, p as i32, start as u32).await }
         };
         fn parse<H: HashSer>(roots: Vec<zcash_client_backend::proto::service::SubtreeRoot>) -> Result<Vec<CommitmentTreeRoot<H>>, String> {
             roots
@@ -531,10 +655,7 @@ impl Syncer {
         let sapling = parse::<sapling::Node>(self.rt.block_on(fetch(ShieldedProtocol::Sapling, s))?).map_err(bad)?;
         let orchard = parse::<orchard::tree::MerkleHashOrchard>(self.rt.block_on(fetch(ShieldedProtocol::Orchard, o))?).map_err(bad)?;
         let ironwood = parse::<orchard::tree::MerkleHashOrchard>(self.rt.block_on(fetch(ShieldedProtocol::Ironwood, i))?).map_err(bad)?;
-        db.put_sapling_subtree_roots(s, &sapling).map_err(db_err)?;
-        db.put_orchard_subtree_roots(o, &orchard).map_err(db_err)?;
-        db.put_ironwood_subtree_roots(i, &ironwood).map_err(db_err)?;
-        Ok([s + sapling.len() as u64, o + orchard.len() as u64, i + ironwood.len() as u64])
+        Ok((sapling, orchard, ironwood))
     }
 
     /// The wallet database refuses a gap between shards. A window that starts in a shard past
@@ -668,12 +789,19 @@ impl Syncer {
             if self.enh_in_flight.contains(&req) || (!local && enhance::not_before(&req).is_some_and(|t| t > now)) {
                 continue;
             }
+            let servers = match enhance::class(&req) {
+                CallClass::Taddr => &self.cfg.taddr,
+                _ => &self.cfg.details,
+            };
+            if servers.is_empty() {
+                continue;
+            }
             self.enh_in_flight.insert(req.clone());
-            let server = enhance::pick(&self.cfg.servers).to_string();
+            let server = enhance::pick(servers).to_string();
             let (proxy, tx, params) = (self.cfg.proxy.clone(), self.tx.clone(), self.params);
             self.rt.spawn(async move {
                 if !local {
-                    tokio::time::sleep(enhance::random_delay()).await;
+                    tokio::time::sleep(enhance::delay(proxy.splits())).await;
                 }
                 let r = enhance::fetch(params, &server, &proxy, &req, tip).await;
                 let _ = tx.send(Msg::Enhanced(req, r));
@@ -898,10 +1026,40 @@ mod tests {
     }
 
     #[test]
+    fn tips_move_to_the_next_server_after_a_failure() {
+        let servers: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+        let mut t = TipSource::default();
+        assert_eq!(t.server(&servers), "a");
+        assert!(t.failed(3), "b is asked at once");
+        assert!(t.failed(3), "and c");
+        assert!(!t.failed(3), "each had its turn: a waits for the next poll");
+        assert_eq!(t.server(&servers), "a");
+        t.answered();
+        assert_eq!(t.server(&servers), "a", "the one that answers keeps the tips");
+        assert!(t.failed(3));
+        assert_eq!(t.in_turn(&servers).collect::<Vec<_>>(), ["b", "c", "a"], "roots from the tip's server first");
+        assert!(!TipSource::default().failed(1), "one server: the next poll asks it again");
+    }
+
+    #[test]
     fn retries_back_off_to_a_minute() {
         let within = |d: Duration, lo: u64| d >= Duration::from_secs(lo) && d <= Duration::from_secs(lo) + Duration::from_secs(lo) / 4;
         assert!(within(retry_delay(1), 1));
         assert!(within(retry_delay(3), 4));
         assert!(within(retry_delay(40), 60));
+    }
+
+    #[test]
+    fn only_a_followed_tip_waits_for_its_blocks() {
+        // Synced to 4,548,993 when 4,548,994 comes: it waits.
+        assert!(holds(4_548_993, 4_548_994, Some(4_548_993)));
+        assert!(holds(4_548_980, 4_548_980 + HOLD_GAP, Some(4_548_980)));
+        // Still scanning toward the old tip, too far ahead, into the next chunk, or not ahead.
+        assert!(!holds(4_548_993, 4_548_994, Some(4_548_900)));
+        assert!(!holds(4_548_993, 4_548_994, None));
+        assert!(!holds(4_548_980, 4_548_981 + HOLD_GAP, Some(4_548_980)));
+        assert!(!holds(4_548_999, 4_549_000, Some(4_548_999)));
+        assert!(!holds(4_548_993, 4_548_993, Some(4_548_993)));
+        assert!(!holds(4_548_993, 4_548_990, Some(4_548_993)));
     }
 }
